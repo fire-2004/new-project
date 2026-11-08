@@ -1,113 +1,107 @@
-// Server realtime sederhana: menyiarkan posisi, nama, dan skin pemain dalam satu dunia.
-const http = require("http");
+// Server realtime RPG (WebSocket). Jalankan: npm i ws && node server.js
+// Fitur: pemain lain, host monster (pemain dengan id terkecil), sinkron pohon/batu.
 const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 3000;
-const MAX_PLAYERS = 30;
-const TICK_MS = 100;          // siaran posisi 10x per detik
-const WORLD_MAX = 100000;     // batas koordinat (anti nilai aneh)
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocketServer({ port: PORT });
 
-const server = http.createServer((req, res) => {
-  // Endpoint cek hidup (health check)
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("RPG server OK. Pemain online: " + players.size);
-});
-
-const wss = new WebSocketServer({ server, maxPayload: 1024 });
-const players = new Map();    // id -> { id, name, skin, x, y, f, a, ws, dirty, lastMsg }
 let nextId = 1;
+let hostId = -1;
+const players = new Map();      // id -> {ws, name, skin, x, y, f, a, dirty}
+const deadNodes = new Map();    // "x,y" -> waktu (ms epoch) pohon/batu hidup lagi
 
-function send(ws, obj) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
-}
+const send = (ws, obj) => { if (ws.readyState === 1) ws.send(typeof obj === "string" ? obj : JSON.stringify(obj)); };
+const broadcast = (obj, exceptId) => {
+  const s = JSON.stringify(obj);
+  for (const [id, p] of players) if (id !== exceptId) send(p.ws, s);
+};
 
-function broadcast(obj, exceptId) {
-  const msg = JSON.stringify(obj);
-  for (const p of players.values()) {
-    if (p.id !== exceptId && p.ws.readyState === 1) p.ws.send(msg);
+function pickHost() {
+  let best = -1;
+  for (const id of players.keys()) if (best < 0 || id < best) best = id;
+  if (best !== hostId) {
+    hostId = best;
+    if (hostId >= 0) broadcast({ t: "host", id: hostId });
   }
 }
 
-function cleanName(s) {
-  s = String(s || "").replace(/[^A-Za-z0-9_]/g, "").slice(0, 14);
-  return s || "Petualang";
-}
-
-function num(v) {
-  v = Number(v);
-  if (!Number.isFinite(v)) return 0;
-  return Math.max(-WORLD_MAX, Math.min(WORLD_MAX, v));
+function aliveDeadNodes() {
+  const now = Date.now(), out = [];
+  for (const [k, until] of deadNodes) {
+    if (until <= now) { deadNodes.delete(k); continue; }
+    const [x, y] = k.split(",").map(Number);
+    out.push([x, y, until - now]);
+  }
+  return out;
 }
 
 wss.on("connection", (ws) => {
-  if (players.size >= MAX_PLAYERS) {
-    send(ws, { t: "full" });
-    ws.close();
-    return;
-  }
+  let id = -1;
 
-  const me = { id: nextId++, name: "Petualang", skin: 0, x: 0, y: 0, f: 0, a: 0,
-               ws, dirty: false, lastMsg: 0, joined: false };
-  ws.isAlive = true;
-  ws.on("pong", () => { ws.isAlive = true; });
-
-  ws.on("message", (data) => {
+  ws.on("message", (raw) => {
     let m;
-    try { m = JSON.parse(data.toString()); } catch (e) { return; }
-    if (!m || typeof m.t !== "string") return;
+    try { m = JSON.parse(raw); } catch { return; }
 
-    if (m.t === "join" && !me.joined) {
-      me.name = cleanName(m.name);
-      me.skin = Math.max(0, Math.min(20, Math.floor(num(m.skin))));
-      me.x = num(m.x); me.y = num(m.y);
-      me.joined = true;
-      players.set(me.id, me);
-      // Kirim daftar pemain yang sudah ada ke pemain baru
+    if (m.t === "join" && id < 0) {
+      id = nextId++;
+      const name = String(m.name || "?").slice(0, 14);
+      players.set(id, { ws, name, skin: m.skin | 0, x: +m.x || 0, y: +m.y || 0, f: 0, a: 0, dirty: false });
+      pickHost();
       const others = [];
-      for (const p of players.values()) {
-        if (p.id !== me.id) others.push({ id: p.id, name: p.name, skin: p.skin, x: p.x, y: p.y, f: p.f, a: p.a });
+      for (const [pid, p] of players) if (pid !== id) others.push({ id: pid, name: p.name, skin: p.skin, x: p.x, y: p.y });
+      send(ws, { t: "welcome", you: id, host: hostId, players: others, dead: aliveDeadNodes() });
+      broadcast({ t: "join", id, name, skin: m.skin | 0, x: +m.x || 0, y: +m.y || 0 }, id);
+      return;
+    }
+    if (id < 0) return;
+    const me = players.get(id);
+
+    switch (m.t) {
+      case "pos":
+        me.x = +m.x || 0; me.y = +m.y || 0; me.f = m.f | 0; me.a = m.a | 0; me.dirty = true;
+        break;
+      case "skin":
+        me.skin = m.skin | 0;
+        broadcast({ t: "skin", id, skin: me.skin }, id);
+        break;
+      case "nd": {                       // pohon/batu habis
+        const x = m.x | 0, y = m.y | 0;
+        const ms = Math.max(1000, Math.min(120000, m.ms | 0));
+        deadNodes.set(x + "," + y, Date.now() + ms);
+        broadcast({ t: "nd", x, y, ms }, id);
+        break;
       }
-      send(ws, { t: "welcome", id: me.id, players: others });
-      broadcast({ t: "join", id: me.id, name: me.name, skin: me.skin, x: me.x, y: me.y }, me.id);
-    } else if (m.t === "pos" && me.joined) {
-      const now = Date.now();
-      if (now - me.lastMsg < 40) return;   // maks ~25 pesan/detik per pemain
-      me.lastMsg = now;
-      me.x = num(m.x); me.y = num(m.y);
-      me.f = Math.max(0, Math.min(7, Math.floor(num(m.f))));
-      me.a = Math.max(0, Math.min(7, Math.floor(num(m.a))));
-      me.dirty = true;
-    } else if (m.t === "skin" && me.joined) {
-      me.skin = Math.max(0, Math.min(20, Math.floor(num(m.skin))));
-      broadcast({ t: "skin", id: me.id, skin: me.skin }, me.id);
+      case "mon":                        // snapshot monster, hanya dari host
+        if (id === hostId) broadcast({ t: "mon", m: m.m }, id);
+        break;
+      case "hit": {                      // pemain non-host memukul monster -> teruskan ke host
+        const h = players.get(hostId);
+        if (id !== hostId && h) send(h.ws, { t: "hit", m: m.m, d: m.d, x: m.x, y: m.y, from: id });
+        break;
+      }
+      case "kill": {                     // hadiah dari host ke pembunuh
+        if (id !== hostId) break;
+        const target = players.get(m.to | 0);
+        if (target) send(target.ws, { t: "kill", x: m.x, y: m.y, lv: m.lv, el: m.el, xp: m.xp });
+        break;
+      }
     }
   });
 
   ws.on("close", () => {
-    if (me.joined) {
-      players.delete(me.id);
-      broadcast({ t: "leave", id: me.id });
-    }
+    if (id < 0) return;
+    players.delete(id);
+    broadcast({ t: "leave", id });
+    pickHost();
   });
   ws.on("error", () => {});
 });
 
-// Siaran posisi: hanya pemain yang bergerak sejak tick terakhir
+// Posisi semua pemain 10x/detik (hanya jika ada yang berubah)
 setInterval(() => {
-  const changed = [];
-  for (const p of players.values()) {
-    if (p.dirty) { changed.push([p.id, Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10, p.f, p.a]); p.dirty = false; }
-  }
-  if (changed.length) broadcast({ t: "state", p: changed });
-}, TICK_MS);
+  const p = [];
+  for (const [id, pl] of players) if (pl.dirty) { p.push([id, pl.x, pl.y, pl.f, pl.a]); pl.dirty = false; }
+  if (p.length) broadcast({ t: "state", p });
+}, 100);
 
-// Putuskan koneksi mati (tidak membalas ping)
-setInterval(() => {
-  for (const ws of wss.clients) {
-    if (ws.isAlive === false) { ws.terminate(); continue; }
-    ws.isAlive = false;
-    ws.ping();
-  }
-}, 30000);
-
-server.listen(PORT, () => console.log("RPG server jalan di port " + PORT));
+console.log("Server jalan di port " + PORT);
